@@ -1,0 +1,531 @@
+# ImmortalWrt 25.12 —— 联发科 MT7620/MT7621/MT76x8 全机型编译
+#
+# 机制：
+#   - 每周定时构建（北京时间周一 03:10，cron 为 UTC 周日 19:10），也支持手动触发。
+#   - prepare 从本仓库 target/linux/<target>/Makefile 解析 SUBTARGETS，每个 subtarget 一个 job。
+#   - 每个 job 用 MULTI_PROFILE + PER_DEVICE_ROOTFS 一次编译该 subtarget 全部机型。
+#   - 闪存 >=128M 的机型由 .github/scripts/inject-istore.py 精确注入：
+#       iStore 软件中心 + iStore 首页(quickstart) + 简体中文语言包。
+#   - MT7981/MT7986 等带无线的机型由 vendor.sh 的 99-wifi-boost 做无线增强
+#       （国码 CN + 5G HE160 / 2.4G HE40 + 802.11k/v/r + beamforming）。
+#   - 默认主题 argon（feeds 自带），产物按平台发布每周 Release。
+name: Build ImmortalWrt 25.12 · RAMIPS
+
+on:
+  schedule:
+    - cron: '50 19 * * 0'   # UTC；北京时间 = UTC+8
+  workflow_dispatch:
+    inputs:
+      subtarget:
+        description: '只编译指定 subtarget（留空 = 全部；如 filogic）'
+        required: false
+        default: ''
+      make_release:
+        description: '编译完成后发布 Release'
+        type: boolean
+        default: true
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  GROUPS_JSON: '{"RAMIPS":[{"target": "ramips", "subs": ["mt7620", "mt7621", "mt76x8", "rt288x", "rt305x", "rt3883"]}]}'
+  EXCLUDE_JSON: '[]'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1500M
+  CCACHE_COMPRESS: 'true'
+  CCACHE_NOHASHDIR: 'true'
+
+jobs:
+  # ============================================================
+  # Job 1：解析编译矩阵（每个 target/subtarget 一个 job）
+  # ============================================================
+  prepare:
+    name: 🧭 生成编译矩阵
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      total: ${{ steps.gen.outputs.total }}
+      summary: ${{ steps.gen.outputs.summary }}
+    steps:
+      - name: Checkout（仅 target/linux）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            target/linux
+
+      - name: 解析 target / subtarget
+        id: gen
+        env:
+          GROUP_SEL: RAMIPS
+          SUB_SEL: ${{ inputs.subtarget || '' }}
+        run: |
+          cat > /tmp/prepare.py <<'PY'
+          import os, re, sys, json, glob
+
+          groups = json.loads(os.environ["GROUPS_JSON"])
+          exclude = set(json.loads(os.environ.get("EXCLUDE_JSON") or "[]"))
+          sel = (os.environ.get("GROUP_SEL") or "").strip().upper()
+          if sel not in groups and sel != "ALL":
+              sys.exit("未知分组: %s（可选: %s）" % (sel, ", ".join(sorted(groups) + ["ALL"])))
+
+          def subs_of(t):
+              p = os.path.join("target/linux", t, "Makefile")
+              if not os.path.isfile(p):
+                  return None
+              txt = open(p, encoding="utf-8", errors="ignore").read()
+              m = re.search(r"^SUBTARGETS\s*:?=\s*(.+)$", txt, re.M)
+              return m.group(1).split() if m else []
+
+          def dev_count(t, s):
+              base = os.path.join("target/linux", t, "image")
+              files = []
+              if s and os.path.isfile(os.path.join(base, s + ".mk")):
+                  files = [os.path.join(base, s + ".mk")]
+              if not files:
+                  files = sorted(glob.glob(os.path.join(base, "*.mk")))
+              if not files and os.path.isfile(os.path.join(base, "Makefile")):
+                  files = [os.path.join(base, "Makefile")]
+              names = set()
+              for f in files:
+                  txt = open(f, encoding="utf-8", errors="ignore").read()
+                  txt = re.sub(r"\\\n", " ", txt)
+                  for mm in re.finditer(r"^\s*TARGET_DEVICES\s*\+?=\s*(.+)$", txt, re.M):
+                      names.update(mm.group(1).split())
+              return len(names)
+
+          entries = []
+          if sel == "ALL" and "ALL" not in groups:
+              # 动态扫描：所有 target（排除 EXCLUDE），每个 subtarget 一条
+              for t in sorted(os.listdir("target/linux")):
+                  if t in exclude:
+                      continue
+                  subs = subs_of(t)
+                  if subs is None:
+                      continue
+                  for s in (subs or [""]):
+                      entries.append((t, s, "ALL"))
+          else:
+              sub_sel = (os.environ.get("SUB_SEL") or "").strip()
+              for item in groups[sel]:
+                  t = item["target"]
+                  subs = item.get("subs") or [""]
+                  real = subs_of(t)
+                  if real is None:
+                      sys.exit("target 不存在: %s" % t)
+                  if not real and subs != [""]:
+                      sys.exit("target %s 没有 subtarget，但配置里指定了 %s" % (t, subs))
+                  for s in subs:
+                      if sub_sel and s != sub_sel:
+                          continue
+                      if s and s not in real:
+                          sys.exit("subtarget 不存在: %s/%s（实际: %s）" % (t, s, real))
+                      entries.append((t, s, sel))
+
+          matrix, seen, rows = [], set(), []
+          for t, s, g in entries:
+              key = "%s/%s" % (t, s)
+              if key in seen:
+                  continue
+              seen.add(key)
+              label = "%s-%s" % (t, s) if s else t
+              cnt = dev_count(t, s)
+              matrix.append({"group": g, "target": t, "sub": s, "label": label, "count": cnt})
+              rows.append("| %s | %s | %s | %s |" % (g, t, s or "(无子目标)", cnt))
+
+          if not matrix:
+              sys.exit("矩阵为空")
+          print("matrix=" + json.dumps({"include": matrix}))  # 动态 matrix 必须是 include 结构
+          print("total=" + str(len(matrix)))
+          print("summary=" + json.dumps({"rows": rows}))
+          print("::notice::共 %d 个编译 job" % len(matrix))
+          for m in matrix:
+              print("  - %-28s 机型约 %s 台" % (m["label"], m["count"]))
+          PY
+          python3 /tmp/prepare.py > /tmp/prepare.out
+          # 只有 K=V 三行进 GITHUB_OUTPUT；::notice:: 与调试行走 stdout 显示
+          grep -E "^(matrix|total|summary)=" /tmp/prepare.out >> "$GITHUB_OUTPUT"
+          cat /tmp/prepare.out
+
+      - name: 写入 Job Summary
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          rows = json.loads(os.environ["SUMMARY_JSON"])["rows"]
+          print("## 🧭 Build ImmortalWrt 25.12 · RAMIPS 编译矩阵")
+          print("")
+          print("| 分组 | target | subtarget | 机型数 |")
+          print("|---|---|---|---|")
+          for r in rows:
+              print(r)
+          PY
+        env:
+          SUMMARY_JSON: ${{ steps.gen.outputs.summary }}
+
+  # ============================================================
+  # Job 2：按 subtarget 编译（matrix，每个子目标独立 job）
+  # ============================================================
+  build:
+    name: 🏗️ ${{ matrix.label }}
+    needs: prepare
+    if: needs.prepare.outputs.total != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放磁盘空间并加大 swap
+        run: |
+          echo "===== 释放前 ====="
+          df -h / | tail -1
+
+          # runner 预装的大型组件（约 25~35G）
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/local/lib/node_modules /usr/lib/jvm \
+                      /usr/share/swift /usr/share/miniconda /usr/share/rust \
+                      /usr/share/kotlinc /usr/share/gradle-* /opt/az \
+                      /opt/microsoft /usr/local/aws-cli /usr/local/.ghcup \
+                      /etc/mysql /etc/php /usr/local/go /opt/pipx 2>/dev/null || true
+
+          # docker / containerd 镜像与数据（约 10G）
+          sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
+          sudo pkill -9 -f dockerd 2>/dev/null || true
+          sudo pkill -9 -f containerd 2>/dev/null || true
+
+          # apt 缓存、snap、日志
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /snap /var/lib/snapd 2>/dev/null || true
+          sudo journalctl --vacuum-size=32M 2>/dev/null || true
+
+          # 重建 4G swap：并行编译内存打满时靠它兜底，避免 OOM 杀掉编译进程
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          if sudo fallocate -l 4G /swapfile 2>/dev/null; then
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null 2>&1 && sudo swapon /swapfile && echo ">>> swap 4G 已启用"
+          else
+            echo "::warning::swap 创建失败，继续（大内存 package 可能有风险）"
+          fi
+
+          echo "===== 释放后 ====="
+          df -h / | tail -1
+          free -h
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get update -qq -o Acquire::Retries=3 || sudo -E apt-get update -qq
+          for i in 1 2 3; do
+            if timeout 1500 sudo -E apt-get install -y --no-install-recommends \
+              ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+              build-essential bzip2 ccache clang cmake cpio curl \
+              device-tree-compiler flex gawk gcc-multilib g++-multilib \
+              genisoimage gettext git gperf haveged help2man intltool \
+              libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+              libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+              libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
+              libssl-dev libtool libxslt1-dev lld llvm lrzsz msmtp ninja-build \
+              p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
+              python3-setuptools qemu-utils rsync scons squashfs-tools \
+              subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto \
+              xxd zlib1g-dev; then
+              echo ">>> 依赖安装完成"
+              break
+            fi
+            echo ">>> 第 $i 次安装失败，30 秒后重试"
+            sleep 30
+          done
+          ccache --version | head -1 || echo "::warning::ccache 不可用，本次不启用缓存"
+
+      - name: 恢复 ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.label }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.label }}-
+            ccache-${{ matrix.target }}-
+
+      - name: 更新并安装 feeds（含 iStore 市场）
+        run: |
+          # 主题 / iStore / 中文包的统一逻辑在 .github/scripts/vendor.sh，四个 workflow 共用
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" feed
+          for i in 1 2 3; do
+            if ./scripts/feeds update -a && ./scripts/feeds install -a; then
+              echo ">>> feeds 完成"
+              break
+            fi
+            echo ">>> 第 $i 次 feeds 失败，20 秒后重试"
+            rm -rf feeds
+            sleep 20
+            [ "$i" = "3" ] && exit 1
+          done
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" store
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" theme
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" collections
+
+      - name: 修补 libffi InstallDev（删除失效的 fficonfig.h 硬拷，对齐官方 25.12）
+        shell: bash
+        run: |
+          f=feeds/packages/libs/libffi/Makefile
+          if [ ! -f "$f" ]; then echo ">>> 无 $f，跳过"; exit 0; fi
+          if ! grep -qF 'fficonfig.h' "$f"; then
+            echo ">>> libffi InstallDev 无 fficonfig.h 拷贝，无需处理"; exit 0
+          fi
+          python3 - "$f" <<'PY'
+          import re, sys
+
+          p = sys.argv[1]
+          s = open(p, encoding="utf-8").read()
+
+          pats = [
+              # feed 原版：$(CP) 三行硬拷 $(GNU_TARGET_NAME)*/fficonfig.h（libffi 3.4.7 已不生成该路径，
+              # openwrt/packages 官方 25.12 分支也删掉了这次拷贝；fficonfig.h 仅 node-ffi-napi 需要）
+              re.compile(r"\t\$\(CP\) \\\n\t\t\$\(PKG_BUILD_DIR\)/\$\(GNU_TARGET_NAME\)\*/fficonfig\.h \\\n\t\t\$\(1\)/usr/include/\n"),
+              # 曾被旧脚本补成的 @ffi=$(find ...) if/else 三行（make 把 $$(find ...) 后的 $(...) 当变量
+              # 引用吞掉，shell 收到的命令残缺，产生 cp: cannot stat 'fi'）
+              re.compile(r"\t@ffi=[^\n]*\\\n\tif \[ -n \"\$+ffi\" \]; then[^\n]*\\\n\telse echo [^\n]*\n"),
+          ]
+          n = 0
+          for pat in pats:
+              s, k = pat.subn("", s)
+              n += k
+          if n == 0:
+              print("SKIP: 未匹配到任何 fficonfig.h 拷贝段")
+              sys.exit(1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("PATCHED: 删除了 %d 段 fficonfig.h 拷贝" % n)
+          PY
+          echo "---- 修补后的 Build/InstallDev ----"
+          sed -n '/define Build\/InstallDev/,/^endef/p' "$f"
+
+      - name: 生成 .config（target / subtarget + ccache + argon 主题 + iStore + 中文）
+        run: |
+          T='${{ matrix.target }}'
+          S='${{ matrix.sub }}'
+          : > .config
+          echo "CONFIG_TARGET_${T}=y" >> .config
+          if [ -n "$S" ]; then
+            echo "CONFIG_TARGET_${T}_${S}=y" >> .config
+          fi
+          cat >> .config <<'CFG'
+          CONFIG_TARGET_MULTI_PROFILE=y
+          # 每个机型单独出 rootfs（等价于 BUILDBOT 的默认值），否则所有已选机型的
+          # profile 包会合并进同一份 rootfs，镜像臃肿且机型专属包互相冲突
+          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+          # CCACHE 的提示项带 "if DEVEL"，未开 DEVEL 时 defconfig 会丢弃 CONFIG_CCACHE
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          # 主题与 iStore/中文包由 vendor.sh 统一注入（默认 luci-theme-argon）
+          CONFIG_PACKAGE_luci-app-store=y
+          CONFIG_PACKAGE_luci-i18n-store-zh-cn=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          # ustream-ssl 默认变体是 mbedtls：若 .config 里 libmbedtls / libustream-mbedtls
+          # 都没选中，world 仍会编译 ustream-ssl-mbedtls，cmake 找不到 mbedtls 库
+          # 直接 NOTFOUND 失败（mt7622/7623/filogic 均会命中）。这里显式选中。
+          CONFIG_PACKAGE_libmbedtls=y
+          CONFIG_PACKAGE_libustream-mbedtls=y
+          # package/index 会给包索引签名，用的是 staging_dir/host/bin/usign；
+          # 该宿主工具来自 package/system/usign 的 HostBuild，只有
+          # CONFIG_PACKAGE_usign=y 才会被编译。默认配置是 SIGNED_PACKAGES=y 且
+          # usign=n，签名阶段必然 "usign: No such file or directory"（Error 127）。
+          # 签名还依赖 TOPDIR/key-build 私钥（仓库无此文件），故直接关闭签名；
+          # SIGNATURE_CHECK 默认跟随 SIGNED_PACKAGES，一并为 n。
+          # CONFIG_SIGNED_PACKAGES is not set
+          # CONFIG_SIGNATURE_CHECK is not set
+          CFG
+          sed -i 's/^          //' .config
+          # 校验主题（argon）+ 全量简体中文语言包
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" config .config
+          make defconfig
+
+          # defconfig 只会选中「Target Profile」choice 里的默认机型；MULTI_PROFILE=y 时
+          # 其余机型在 .config 里全是 "# CONFIG_TARGET_DEVICE_... is not set"，image 阶段
+          # DEVICE_CHECK_PROFILE 一律为 n → 日志里 "启用机型: 0 个"，world 虽然返回成功，
+          # 但 bin/targets 下只有 bl2.bin，没有任何固件。这里显式打开该子目标全部机型，
+          # 再跑一次 defconfig 让机型 select 出来的依赖（kmod / 固件包）自洽。
+          # 机型名普遍带 "-"（bananapi_bpi-r2、xiaomi_mi-router-ax3000t …），旧写法
+          # [A-Za-z0-9_]* 只匹配无连字符的名字：mt7623 三个机型全带 "-"，一个都打不开
+          # （启用机型: 0 个）；filogic / ipq 等则是部分机型被静默漏掉。字符集补上 "-"。
+          # 只动 CONFIG_TARGET_DEVICE_...（Target Devices 菜单里的机型开关）；
+          # CONFIG_TARGET_<t>_<s>_DEVICE_... 是 "Target Profile" choice 的成员，
+          # 一并置 y 会让 choice 冲突，defconfig 反而把 MULTI_PROFILE 丢掉（机型数归零）。
+          sed -i -E 's/^# (CONFIG_TARGET_DEVICE_[A-Za-z0-9_-]+) is not set$/\1=y/' .config
+          make defconfig
+          n_dev="$(grep -c '^CONFIG_TARGET_DEVICE_.*=y' .config || true)"
+          n_dev="${n_dev:-0}"
+          echo "启用机型: ${n_dev} 个"
+          [ "${n_dev}" -gt 0 ] || { echo "::error::没有任何机型被启用，产物会是空"; exit 1; }
+
+          # ---- 闪存 >=128M 机型注入 iStore 软件中心 + 首页 + 中文包 ----
+          # 必须精确到机型（DEVICE_PACKAGES），不能全局在 .config 开：同一 subtarget
+          # 里小闪存机型会一起装上商店/语言包导致 image 超限。列表见脚本内 PLATFORMS。
+          python3 "$GITHUB_WORKSPACE/.github/scripts/inject-istore.py" "$T" "$S"
+
+          # 主题兜底：99 号 uci-defaults 晚于主题包自带的 30_luci-theme-*，
+          # 启动时强制把 mediaurlbase 指向本主题，避免 bootstrap 抢默认
+          theme=$(cat "$GITHUB_WORKSPACE/.theme")
+          if [ "$theme" = "vantage" ] && ! grep -q '^CONFIG_PACKAGE_luci-theme-vantage=y$' .config; then
+            echo "::warning::vantage 主题依赖不满足，回退 argon"
+            rm -rf package/luci-theme-vantage package/luci-app-vantage
+            echo argon > "$GITHUB_WORKSPACE/.theme"
+            bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" collections
+            bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" config .config
+            make defconfig
+            theme=argon
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" uci-defaults
+
+          echo "===== 校验 ====="
+          grep -q "^CONFIG_TARGET_${T}=y" .config || { echo "::error::target $T 未选中"; exit 1; }
+          if [ -n "$S" ]; then
+            grep -q "^CONFIG_TARGET_${T}_${S}=y" .config || { echo "::error::subtarget $T/$S 未选中"; exit 1; }
+          fi
+          echo "目标: $T ${S:-（无 subtarget）}"
+          echo "启用机型: $(grep -c '^CONFIG_TARGET_DEVICE_.*=y' .config) 个"
+          grep -q "^CONFIG_CCACHE=y" .config && echo "ccache: 已启用" || echo "::warning::ccache 未启用"
+          grep -q "^CONFIG_PACKAGE_luci-theme-${theme}=y" .config && echo "主题: ${theme} 已启用" || { echo "::error::${theme} 主题未启用"; exit 1; }
+          grep -q "^CONFIG_PACKAGE_luci-app-store=y" .config || echo "::warning::iStore 市场未选入"
+          n_zh=$(grep -cE '^CONFIG_PACKAGE_luci-i18n-.+-zh-cn=y$' .config || true)
+          echo "简体中文语言包: ${n_zh:-0} 个"
+          grep -q "CONFIG_SIGNED_PACKAGES is not set" .config || { echo "::error::包索引签名未关闭，package/index 会因缺少 usign 宿主工具失败"; exit 1; }
+          if grep -q "^CONFIG_PACKAGE_luci-theme-bootstrap=y" .config; then
+            echo "::warning::bootstrap 仍被其他包依赖（${theme} 仍为默认主题，由 uci-defaults 保证）"
+          else
+            echo "主题: bootstrap 未安装，${theme} 为唯一主题"
+          fi
+
+      - name: 下载源码包
+        run: |
+          for i in 1 2 3; do
+            if make -j8 download < /dev/null; then
+              echo ">>> 下载完成"
+              break
+            fi
+            echo ">>> 第 $i 次下载有失败项，重试"
+            sleep 15
+          done
+          # 清单里没下全的单独再拉一遍（不阻塞编译）
+          make -j1 download < /dev/null 2>&1 | tail -20 || true
+
+      - name: 编译固件
+        run: |
+          export CCACHE_DIR CCACHE_MAXSIZE CCACHE_COMPRESS CCACHE_NOHASHDIR
+          mkdir -p "$CCACHE_DIR"
+          ccache -s 2>/dev/null || true
+          set -o pipefail
+          echo ">>> 并行编译 make -j$(nproc)"
+          if make -j"$(nproc)" 2>&1 | tee build.log; then
+            echo ">>> ✅ 编译成功"
+          else
+            echo "::warning::并行编译失败，改用单线程 V=s 复现真实错误"
+            make -j1 V=s 2>&1 | tee -a error.log || true
+            echo "===== error.log 尾部 150 行 ====="
+            tail -150 error.log || true
+            ccache -s 2>/dev/null || true
+            exit 1
+          fi
+          ccache -s 2>/dev/null || true
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.label }}
+          path: |
+            build.log
+            error.log
+            .config
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: 收集产物
+        run: |
+          T='${{ matrix.target }}'
+          S='${{ matrix.sub }}'
+          d="bin/targets/$T"
+          [ -n "$S" ] && d="$d/$S"
+          mkdir -p out
+          if [ -d "$d" ]; then
+            find "$d" -maxdepth 1 -type f \
+              \( -name '*.bin' -o -name '*.itb' -o -name '*.img' -o -name '*.img.gz' \
+                 -o -name '*.vmdk' -o -name '*.qcow2' -o -name '*.ubi' -o -name '*.trx' \
+                 -o -name '*.tar.gz' -o -name '*.squashfs' -o -name '*.efi' \
+                 -o -name 'sha256sums' -o -name 'profiles.json' -o -name '*.buildinfo' \) \
+              -exec cp {} out/ \; 2>/dev/null || true
+          fi
+          n=$(ls out 2>/dev/null | wc -l)
+          echo "产物文件: $n 个"
+          ls -lh out 2>/dev/null | head -40 || true
+          if [ "$n" -eq 0 ]; then
+            echo "::error::$d 下没有产物"
+            ls -la "$(dirname "$d")" || true
+            exit 1
+          fi
+          {
+            echo "## 🏗️ ${{ matrix.label }} 编译完成"
+            echo ""
+            echo "- target/subtarget: \`$T / ${S:-无}\`"
+            echo "- 产物: $n 个"
+            echo ""
+            echo "| 文件 | 大小 |"
+            echo "|---|---|"
+            ls -lh out | tail -n +2 | awk '{printf "| %s | %s |\n", $9, $5}'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.label }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: ${{ github.event_name == 'schedule' || inputs.make_release != false }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          L='${{ matrix.label }}'
+          TAG="immortalwrt-25.12-ramips-${L}-$(TZ=Asia/Shanghai date +%G-W%V)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            OLD="$TAG"
+            TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
+            echo "::warning::${OLD} 已存在（历史保留），本次使用 ${TAG}"
+          fi
+
+          cat > notes.md <<EOF
+          ImmortalWrt 25.12（联发科 MT7620/MT7621/MT76x8）自动编译：$L
+
+          - 触发方式: ${{ github.event_name }}
+          - target/subtarget: ${{ matrix.target }} / ${{ matrix.sub }}
+          - 机型数: 约 ${{ matrix.count }} 台（defconfig 默认全选）
+          - 提交: ${{ github.sha }}
+          - 日志: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - 默认 IP: 192.168.1.1（ImmortalWrt 默认）/ 用户名 root / 无密码
+          EOF
+
+          ls -lh out/
+          gh release create "$TAG" out/* \
+            --title "ImmortalWrt 25.12 ramips $L ($(TZ=Asia/Shanghai date +%Y-%m-%d))" \
+            --notes-file notes.md
+          echo ">>> 已发布: $TAG"

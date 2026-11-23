@@ -1,0 +1,112 @@
+{
+  "mediatek/filogic": [
+    "airtel_aap4221zy",
+    "asus_rt-ax59u",
+    "asus_tuf-ax4200",
+    "bananapi_bpi-r3",
+    "bananapi_bpi-r4",
+    "bananapi_bpi-r4-poe",
+    "cmcc_rax3000m",
+    "cmcc_rax3000me",
+    "cudy_tr3000-256mb-v1",
+    "cudy_wr3000u-v1",
+    "glinet_gl-be10000",
+    "glinet_gl-mt2500",
+    "glinet_gl-mt3000",
+    "glinet_gl-mt3600be",
+    "glinet_gl-x3000",
+    "glinet_gl-xe3000",
+    "huasifei_wh3000-emmc",
+    "huasifei_wh3000-pro-emmc",
+    "huasifei_wh3000-pro-nand",
+    "huasifei_wh3000r-nand",
+    "jcg_q30-pro",
+    "keenetic_kn-1812",
+    "keenetic_kn-3811",
+    "mediatek_mt7986a-rfb-nand",
+    "netcore_n60",
+    "nradio_c8-668gl",
+    "openembed_som7981",
+    "qihoo_360t7",
+    "teralink_tl3020-256mb",
+    "tplink_tl-xdr4288",
+    "tplink_tl-xdr6086",
+    "tplink_tl-xdr6088",
+    "unielec_u7981-01-emmc",
+    "unielec_u7981-01-nand",
+    "xiaomi_mi-router-ax3000t"
+  ],
+  "mediatek/mt7623": [
+    "unielec_u7623-02-emmc-512m-legacy"
+  ],
+  "qualcommax/ipq807x": [
+    "asus_rt-ax89x-b1",
+    "asus_rt-ax89x-b2",
+    "dynalink_dl-wrx36",
+    "edgecore_eap102",
+    "linksys_homewrk",
+    "linksys_mx",
+    "linksys_mx4200v1",
+    "linksys_mx4200v2",
+    "linksys_mx4300",
+    "linksys_mx4x00",
+    "linksys_mx5300",
+    "linksys_mx8500",
+    "xiaomi_ax3600",
+    "xiaomi_ax9000"
+  ],
+  "qualcommax/ipq60xx": [
+    "linksys_mr7500"
+  ],
+  "ath79/nand": [
+    "glinet_gl-ar300m-common-nand",
+    "glinet_gl-ar300m-nand",
+    "glinet_gl-ar750s-nor-nand",
+    "glinet_gl-e750",
+    "glinet_gl-s200-nor-nand",
+    "glinet_gl-x1200-nor-nand",
+    "glinet_gl-xe300",
+    "netgear_ath79_nand"
+  ],
+  "ramips/mt7621": [
+    "c-life_xg1",
+    "dlink_dir_nand_128m",
+    "iodata_nand",
+    "netgear_sercomm_nand",
+    "tplink_ex220-v1-nand",
+    "xiaomi_mi-router-3-pro"
+  ],
+  "realtek/rtl930x": [
+    "hasivo_f1100w-4sx-4xgt-512mb",
+    "hasivo_f1100wp-4sx-4xgt-512mb"
+  ],
+  "airoha/an7581": [
+    "nokia_xg-040g-md",
+    "quantum_q1000k-ubi"
+  ],
+  "airoha/an7583": [
+    "nokia_xg-040g-mf"
+  ],
+  "x86/64": [
+    "generic"
+  ],
+  "x86/generic": [
+    "generic"
+  ],
+  "x86/legacy": [
+    "generic"
+  ],
+  "x86/geode": [
+    "generic",
+    "geos"
+  ],
+  "mediatek/mt7622": [
+    "bananapi_bpi-r64"
+  ],
+  "rockchip/armv8": [
+    "friendlyarm_nanopi-r4s",
+    "friendlyarm_nanopi-r5s",
+    "radxa_rock-3a",
+    "sinovoip_bpi-r2-pro"
+  ]
+}
