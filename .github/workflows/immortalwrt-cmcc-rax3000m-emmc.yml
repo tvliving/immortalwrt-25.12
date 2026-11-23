@@ -317,18 +317,21 @@ jobs:
           echo "===== out/ ====="
           ls -lh out || true
 
+          # nullglob 下必须用数组判断文件存在：直接 `ls out/*glob` 在无匹配时会
+          # 展开成空参数，`ls` 无参数返回 0，导致 "不该有 factory" 误判（曾致 eMMC run 失败）。
+          factory=( out/*"${DEVICE}"-squashfs-factory.bin )
+          sysup=( out/*"${DEVICE}"-squashfs-sysupgrade.bin )
           if [ "$FLAVOR" = "emmc" ]; then
-            ls out/*"${DEVICE}"-squashfs-sysupgrade.bin >/dev/null 2>&1 \
+            [ "${#sysup[@]}" -ge 1 ] \
               || { echo "::error::eMMC 机型缺 sysupgrade.bin"; exit 1; }
-            if ls out/*"${DEVICE}"-squashfs-factory.bin >/dev/null 2>&1; then
-              echo "::error::eMMC 机型不该有 factory.bin"; exit 1
-            fi
+            [ "${#factory[@]}" -eq 0 ] \
+              || { echo "::error::eMMC 机型不该有 factory.bin"; exit 1; }
             n=$(ls -1 out | wc -l)
             [ "$n" -eq 1 ] || { echo "::error::eMMC 产物应只有 1 个 sysupgrade，实际 $n"; ls out; exit 1; }
           else
-            ls out/*"${DEVICE}"-squashfs-factory.bin >/dev/null 2>&1 \
+            [ "${#factory[@]}" -ge 1 ] \
               || { echo "::error::NAND 机型缺 factory.bin"; exit 1; }
-            ls out/*"${DEVICE}"-squashfs-sysupgrade.bin >/dev/null 2>&1 \
+            [ "${#sysup[@]}" -ge 1 ] \
               || { echo "::error::NAND 机型缺 sysupgrade.bin"; exit 1; }
             n=$(ls -1 out | wc -l)
             [ "$n" -eq 2 ] || { echo "::error::NAND 产物应为 factory + sysupgrade 共 2 个，实际 $n"; ls out; exit 1; }
