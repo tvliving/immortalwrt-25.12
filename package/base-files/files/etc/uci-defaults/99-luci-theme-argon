@@ -1,0 +1,17 @@
+#!/bin/sh
+# 默认主题设为 Argon。
+#
+# LuCI 的 uci-defaults 按文件名顺序执行：luci-theme-bootstrap 自带的
+# 30_luci-theme-bootstrap 会先把 mediaurlbase 设成 /luci-static/bootstrap，
+# 这里用 99 号覆盖掉它，保证开机就是 argon。
+#
+# 只有 luci-theme-argon 真的装进镜像时才有意义（include/target.mk 里在
+# CONFIG_PACKAGE_luci 打开时会自动带上该包）；没装也不会报错，LuCI 会
+# 回退到已安装的主题。
+[ -f /etc/config/luci ] || touch /etc/config/luci
+
+uci -q set luci.themes.Argon='/luci-static/argon'
+uci -q set luci.main.mediaurlbase='/luci-static/argon'
+uci -q commit luci
+
+exit 0

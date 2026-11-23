@@ -111,6 +111,15 @@ endif
 # Add device specific packages (here below to allow device type set from subtarget)
 DEFAULT_PACKAGES += $(DEFAULT_PACKAGES.$(DEVICE_TYPE))
 
+# 默认主题 luci-theme-argon：
+# 只在镜像本身已经选了 LuCI（CONFIG_PACKAGE_luci）时才加，避免无 LuCI 的镜像
+# 被 argon → luci-base → 一堆依赖拖胖。真正的「默认主题」由 base-files 里的
+# package/base-files/files/etc/uci-defaults/99-luci-theme-argon 强制指定
+# （99 号晚于 luci-theme-bootstrap 的 30 号脚本，能覆盖 mediaurlbase）。
+ifneq ($(CONFIG_PACKAGE_luci),)
+  DEFAULT_PACKAGES += luci-theme-argon
+endif
+
 # Add tweaked packages
 # DEFAULT_PACKAGES += $(DEFAULT_PACKAGES.tweak)
 
