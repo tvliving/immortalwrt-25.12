@@ -181,7 +181,8 @@ jobs:
       - name: 生成 .config（只有本机型 + argon 主题 + iStore + 强制中文）
         run: |
           set -euo pipefail
-          DEV_LIST="cmcc_rax3000m-nand-256m cmcc_xr30-nand-256m"
+          # 机型清单唯一来源是 job env DEVICES；这里只做别名，避免步骤内硬编码第二份。
+          DEV_LIST="$DEVICES"
           : > .config
           cat >> .config <<'CFG'
           CONFIG_TARGET_mediatek=y
@@ -310,6 +311,8 @@ jobs:
         id: collect
         run: |
           set -euo pipefail
+          # 步骤级 shell 不继承其它步骤的变量，必须自己绑一次（否则 -u 下 unbound variable）
+          DEV_LIST="$DEVICES"
           B=bin/targets/mediatek/filogic
           mkdir -p out
           shopt -s nullglob
