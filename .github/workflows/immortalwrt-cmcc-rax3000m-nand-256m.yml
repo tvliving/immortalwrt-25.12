@@ -356,7 +356,9 @@ jobs:
           if-no-files-found: error
 
       - name: 发布 Release
-        if: ${{ github.event_name == 'schedule' || inputs.make_release != false }}
+        # 只在定时任务、或手动 dispatch 且勾选了发布时才发 Release；
+        # push（改 workflow/脚本的验证跑）不发，避免把验证产物塞进 Releases
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.make_release != false) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
