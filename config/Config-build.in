@@ -71,7 +71,12 @@ menu "Global build settings"
 	config USE_APK
 		imply PACKAGE_apk-openssl
 		bool "Use APK instead of OPKG to build distribution"
-		default y
+		default n
+		help
+		  OpenWrt 25.12 上游默认用 apk 构建发行版。本仓库把它改回 opkg/ipk：
+		  默认 n 表示产出 .ipk 包并用 opkg 作为设备上的包管理器，
+		  这样 iStore 等仍按 ipk/opkg 生态走的应用可以直接使用。
+		  需要 apk 时在 .config 里显式打开 CONFIG_USE_APK=y 即可。
 
 	config SIGN_EACH_PACKAGE
 		bool "Cryptographically sign each package .apk file"
