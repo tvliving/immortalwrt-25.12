@@ -69,7 +69,8 @@ define Device/cmcc_rax3000m-emmc
   DEVICE_MODEL := RAX3000M (eMMC version)
   DEVICE_DTS := mt7981b-cmcc-rax3000m-emmc-lede
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 f2fsck mkf2fs
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 f2fsck mkf2fs \\
+	luci-app-store luci-i18n-base-zh-cn
   KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
   KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
@@ -82,7 +83,8 @@ define Device/cmcc_rax3000m-nand
   DEVICE_MODEL := RAX3000M (NAND version)
   DEVICE_DTS := mt7981b-cmcc-rax3000m-nand-lede
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 \\
+	luci-app-store luci-i18n-base-zh-cn
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k
   PAGESIZE := 2048
@@ -100,7 +102,8 @@ define Device/cmcc_xr30-emmc
   DEVICE_MODEL := XR30 (eMMC version)
   DEVICE_DTS := mt7981b-cmcc-xr30-emmc
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 f2fsck mkf2fs
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 f2fsck mkf2fs \\
+	luci-app-store luci-i18n-base-zh-cn
   KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
   KERNEL_INITRAMFS := kernel-bin | lzma | \\
 \tfit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
@@ -115,7 +118,8 @@ define Device/cmcc_xr30-nand
   DEVICE_VARIANT := (U-Boot mod)
   DEVICE_DTS := mt7981b-cmcc-xr30-nand
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-usb3 \\
+	luci-app-store luci-i18n-base-zh-cn
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k
   PAGESIZE := 2048
@@ -142,6 +146,8 @@ assert sec.count('IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)'
 assert sec.count('IMAGES += factory.bin') == 2, 'factory.bin 只该出现在 NAND 机型'
 assert sec.count('IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata') == 4, \
     '四个机型都该走 sysupgrade-tar'
+assert sec.count('luci-app-store') == 4, \
+    'iStore 应注入到 4 个机型的 DEVICE_PACKAGES（kconfig 里 CONFIG_PACKAGE_ 会被依赖压成 n）'
 print('✔ filogic.mk 校验通过（eMMC 只有 sysupgrade，NAND 有 factory + sysupgrade）')
 PYEOF
 
