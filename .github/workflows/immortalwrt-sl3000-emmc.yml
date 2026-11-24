@@ -234,8 +234,15 @@ jobs:
           n_dev=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || true)
           [ "${n_dev:-0}" -eq 1 ] || { echo "::error::启用机型应为 1，实际 ${n_dev}"; exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-theme-argon=y$' .config || { echo "::error::argon 未启用"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config || { echo "::error::iStore 未选中"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_luci-i18n-base-zh-cn=y$' .config || { echo "::error::中文包未选中"; exit 1; }
+          # iStore / 中文基础包走 DEVICE_PACKAGES（sl3000-inject.sh 写进 filogic.mk），
+          # 不能拿 .config 里的 =y 当门禁：luci-app-store 在 kconfig 里带
+          # `depends on !(PACKAGE_TAR_XZ) || PACKAGE_xz-utils` 的变体约束，tar 侧
+          # TAR_XZ 默认 y，defconfig 会把 store 静默压成 n（HY3000/CMCC/TR3000 同款，
+          # 它们也只校验 filogic.mk）。端到端门禁放在「收集产物」按镜像 manifest 校验。
+          grep -q 'luci-app-store' target/linux/mediatek/image/filogic.mk \
+            || { echo "::error::filogic.mk 没注入 iStore"; exit 1; }
+          grep -q 'luci-i18n-base-zh-cn' target/linux/mediatek/image/filogic.mk \
+            || { echo "::error::filogic.mk 没注入中文基础包"; exit 1; }
           grep -q '^CONFIG_LUCI_LANG_zh_Hans=y$' .config || { echo "::error::中文开关未启用"; exit 1; }
           grep -q "luci.main.lang='zh_cn'" files/etc/uci-defaults/99-luci-lang-zh-cn || { echo "::error::默认语言不是 zh_cn"; exit 1; }
           grep -q "luci.main.mediaurlbase='/luci-static/argon'" files/etc/uci-defaults/99-luci-theme-argon || { echo "::error::默认主题不是 argon"; exit 1; }
@@ -331,6 +338,14 @@ jobs:
           if ls out/ | grep -qiE 'preloader|bl31|\.fip$|gpt|initramfs|recovery'; then
             echo "::error::产物里出现引导工件，拒绝发布"; ls out; exit 1
           fi
+          # 端到端包清单校验（manifest 只生成在 $B，不随产物拷贝）：
+          # 主题 / iStore / 中文必须真的进了最终 rootfs
+          man=( "$B"/*.manifest )
+          [ "${#man[@]}" -ge 1 ] || { echo "::error::缺 manifest，无法校验包清单"; ls "$B" | head; exit 1; }
+          for p in luci-app-store luci-theme-argon luci-i18n-base-zh-cn; do
+            grep -q "$p" "${man[0]}" \
+              || { echo "::error::镜像 manifest 里没有 $p"; grep -nE 'luci-(app-store|theme|i18n-base)' "${man[0]}" || true; exit 1; }
+          done
           (cd out && sha256sum ./* > sha256sums.txt)
           {
             echo "## 🏗️ SL-3000 eMMC 编译完成"
