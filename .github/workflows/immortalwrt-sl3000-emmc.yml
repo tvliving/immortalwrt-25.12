@@ -249,9 +249,20 @@ jobs:
           grep -q "CONFIG_SIGNED_PACKAGES is not set" .config || { echo "::error::签名关闭失败"; exit 1; }
 
           # WiFi 包 + 设备块精确校验
+          # kmod-mt7915e 是本 workflow 显式写进 .config 的（=y），可以当硬门禁；
+          # kmod-mt7981-firmware / mt7981-wo-firmware 只存在于 filogic.mk 的 DEVICE_PACKAGES，
+          # per-device rootfs 下 kconfig 只会把它们标成 =m（内核模块默认 m），grep =y 必然误报
+          # （run 45335249036 就挂在这里）。硬门禁改为 filogic.mk 精确断言 + 产物 manifest 端到端校验。
           grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y$' .config || { echo "::error::mt7915e 未选中"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_kmod-mt7981-firmware=y$' .config || { echo "::error::MT7981 firmware 未选中"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_mt7981-wo-firmware=y$' .config || { echo "::error::MT7981 wo-firmware 未选中"; exit 1; }
+          WIFI_PKGS="kmod-mt7981-firmware mt7981-wo-firmware"
+          for k in $WIFI_PKGS; do
+            if grep -qE "^CONFIG_PACKAGE_${k}=[ym]$" .config; then
+              echo "  [ok] $k = $(grep -E "^CONFIG_PACKAGE_${k}=" .config | head -1 | cut -d= -f2)"
+            else
+              echo "::warning::$k 未出现在 .config（预期由 DEVICE_PACKAGES 在镜像阶段安装，稍后用 manifest 校验）"
+            fi
+          done
+          echo "WIFI_PKGS=$WIFI_PKGS" >> "$GITHUB_ENV"
           python3 - <<'PY'
           s = open('target/linux/mediatek/image/filogic.mk', encoding='utf-8').read()
           b = s[s.index('define Device/sl_3000-emmc'):s.index('TARGET_DEVICES += sl_3000-emmc')]
@@ -342,9 +353,9 @@ jobs:
           # 主题 / iStore / 中文必须真的进了最终 rootfs
           man=( "$B"/*.manifest )
           [ "${#man[@]}" -ge 1 ] || { echo "::error::缺 manifest，无法校验包清单"; ls "$B" | head; exit 1; }
-          for p in luci-app-store luci-theme-argon luci-i18n-base-zh-cn; do
+          for p in luci-app-store luci-theme-argon luci-i18n-base-zh-cn $WIFI_PKGS; do
             grep -q "$p" "${man[0]}" \
-              || { echo "::error::镜像 manifest 里没有 $p"; grep -nE 'luci-(app-store|theme|i18n-base)' "${man[0]}" || true; exit 1; }
+              || { echo "::error::镜像 manifest 里没有 $p"; grep -nE 'luci-(app-store|theme|i18n-base)|mt79' "${man[0]}" || true; exit 1; }
           done
           (cd out && sha256sum ./* > sha256sums.txt)
           {
