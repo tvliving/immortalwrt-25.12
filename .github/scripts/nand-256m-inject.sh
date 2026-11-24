@@ -2,7 +2,7 @@
 # 把 3 台 NAND 256M 机型注入 ImmortalWrt 25.12 源码树：
 #   cmcc_rax3000m-nand-256m  CMCC RAX3000M NAND 硬改 256M
 #   cmcc_xr30-nand-256m      CMCC XR30    NAND 硬改 256M
-#   cudy_tr3000-256mb-v1     Cudy TR3000 256MB（ImmortalWrt 原生支持，只补 factory 产物）
+#   cudy_tr3000-256mb-v1     Cudy TR3000 256MB（原生支持；多分区布局，只 sysupgrade 不产 factory）
 #
 # 前两台在 tvliving/lede 里没有独立机型（lede 只有 128M 的 nand/emmc），
 # 这里按 lede 的 NAND 方案派生：dts 用 lede 的 128M 版（.github/cmcc/dts 里已有，
@@ -108,23 +108,22 @@ else:
     s = s + BLOCK
     print('filogic.mk: 已追加 2 台 256M 机型')
 
-# --- 原生 cudy_tr3000-256mb-v1：补 factory.bin（原本只有 sysupgrade） ---
+# --- 原生 cudy_tr3000-256mb-v1：多分区设备，只保留 sysupgrade，不产 factory ---
+# TR3000-256M 是 KERNEL_IN_UBI + sysupgrade-tar 写 kernel/rootfs 两分区的多分区布局，
+# append-ubi 整盘镜像不适用；若上游已带 factory.bin 则移除，保持 sysupgrade-only。
 m = re.search(r'define Device/cudy_tr3000-256mb-v1\n(.*?)\nendef', s, re.S)
 assert m, 'filogic.mk 里找不到 cudy_tr3000-256mb-v1（ImmortalWrt 原生机型，改名了？）'
 body = m.group(1)
 if 'IMAGE/factory.bin' in body:
-    print('filogic.mk: tr3000-256mb 已有 factory.bin，跳过')
+    kept = [ln for ln in body.split('\n')
+            if not re.match(r'\s*IMAGES \+= factory\.bin\s*$', ln)
+            and not re.match(r'\s*IMAGE/factory\.bin\s*:=', ln)]
+    nb = '\n'.join(kept)
+    assert 'IMAGE/factory.bin' not in nb, 'tr3000-256mb 的 factory 行未清理干净'
+    s = s[:m.start(1)] + nb + s[m.end(1):]
+    print('filogic.mk: tr3000-256mb 已移除 factory.bin（多分区，只保留 sysupgrade）')
 else:
-    assert 'IMAGE_SIZE := 235520k' in body, 'tr3000-256mb 的 IMAGE_SIZE 变了，需人工核对'
-    assert 'IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata' in body, \
-        'tr3000-256mb 不是 sysupgrade-tar 口径，需人工核对'
-    new_body = body.replace(
-        '  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata',
-        '  IMAGES += factory.bin\n'
-        '  IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)\n'
-        '  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata', 1)
-    s = s[:m.start(1)] + new_body + s[m.end(1):]
-    print('filogic.mk: cudy_tr3000-256mb-v1 已补 factory.bin（append-ubi）')
+    print('filogic.mk: tr3000-256mb 本就无 factory.bin（多分区 sysupgrade-only）')
 
 # --- 同机型补 iStore + 简体中文语言包（kconfig 里 DEPENDS 不满足会被静默压成 n，
 #     与其它平台 workflow 的 inject-istore 一样走 DEVICE_PACKAGES）---
@@ -147,8 +146,8 @@ for dev in ('cmcc_rax3000m-nand-256m', 'cmcc_xr30-nand-256m'):
 sec = final[final.index('# NAND 硬改 256M'):]
 assert sec.count('IMAGE/factory.bin := append-ubi') == 2, '256M 两台都应带 factory.bin'
 m2 = re.search(r'define Device/cudy_tr3000-256mb-v1\n(.*?)\nendef', final, re.S)
-assert m2 and 'IMAGE/factory.bin := append-ubi' in m2.group(1), 'tr3000-256mb 的 factory 未写入'
-print('✔ filogic.mk 校验通过（256M 两台 + tr3000-256mb，均 factory + sysupgrade）')
+assert m2 and 'IMAGE/factory.bin' not in m2.group(1), 'tr3000-256mb 必须 sysupgrade-only（多分区，不产 factory）'
+print('✔ filogic.mk 校验通过（256M 两台 factory+sysupgrade；tr3000-256mb 仅 sysupgrade）')
 PYEOF
 
 # ---------------------------------------------------------------------------

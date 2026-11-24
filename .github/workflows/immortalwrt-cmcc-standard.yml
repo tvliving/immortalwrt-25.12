@@ -1,22 +1,22 @@
-# ImmortalWrt 25.12 · CMCC RAX3000M（eMMC）单机型编译
+# ImmortalWrt 25.12 · CMCC RAX3000M + XR30 常规版（NAND + eMMC）多机型编译
 #
-# 机型来自 tvliving/lede master，dts 与注入逻辑见 .github/cmcc/dts 与
-# .github/scripts/cmcc-inject.sh（四机型共用，幂等）。
+# 机型由 .github/scripts/cmcc-inject.sh 注入（四机型共用，幂等）：
+#   cmcc_rax3000m-nand / cmcc_xr30-nand   NAND，factory + sysupgrade 双产物
+#   cmcc_rax3000m-emmc / cmcc_xr30-emmc   eMMC，仅 sysupgrade（写 kernel/rootfs 两分区）
 #
-# 产物口径（与 lede 一致）：
+# 产物口径（沿用机器现有 U-Boot，不产 preloader / fip / gpt / itb）：
 #   NAND → *-squashfs-factory.bin（append-ubi 全量包）+ *-squashfs-sysupgrade.bin
-#   eMMC → 只有 *-squashfs-sysupgrade.bin（sysupgrade-tar 写 kernel/rootfs 两分区）
-#   不产 preloader / fip / gpt / itb，沿用机器现有 U-Boot。
+#   eMMC → 只有 *-squashfs-sysupgrade.bin
 #
-# 与其它机型 workflow 同一套策略：argon 主题 + iStore 软件中心 + 强制简体中文
-# （luci.main.lang=zh_cn + LUCI_LANG_zh_Hans + 全量 luci-i18n-*-zh-cn）。
+# 界面：argon 主题 + iStore 软件中心 + 强制简体中文；无线：mt7915e + mt7981-wo-firmware
+# + 首启 99-wifi-boost（国码 CN / 5G HE160 / 2.4G HE40 / 802.11k v r / beamformee）。
 #
-# 定时：每周一 08:10（北京时间）= 本仓库 build-mediatek.yml 的 03:10 之后 5 小时。
-name: ImmortalWrt 25.12 · CMCC RAX3000M (eMMC)
+# 定时：每周一 08:10（北京时间），与其它 CMCC workflow 同时段。
+name: ImmortalWrt 25.12 · CMCC RAX3000M + XR30 常规版 (NAND + eMMC)
 
 on:
   schedule:
-    # UTC 周一 00:10 = 北京周一 08:10（build-mediatek.yml 是北京周一 03:10，晚 5 小时）
+    # UTC 周一 00:10 = 北京周一 08:10（与其它 CMCC workflow 同时段）
     - cron: '10 0 * * 1'
   workflow_dispatch:
     inputs:
@@ -27,21 +27,22 @@ on:
   push:
     branches: [master]
     paths:
-      - '.github/workflows/immortalwrt-cmcc-rax3000m-emmc.yml'
+      - '.github/workflows/immortalwrt-cmcc-standard.yml'
       - '.github/scripts/cmcc-inject.sh'
       - '.github/cmcc/**'
 permissions:
   contents: write
 
 concurrency:
-  group: immortalwrt-cmcc-rax3000m-emmc
+  group: immortalwrt-cmcc-standard
   cancel-in-progress: false
 
 env:
   TZ: Asia/Shanghai
-  DEVICE: cmcc_rax3000m-emmc
-  FLAVOR: emmc
-  TAG_PREFIX: immortalwrt-25.12-cmcc-rax3000m-emmc
+  NAND_FULL: "cmcc_rax3000m-nand cmcc_xr30-nand"
+  SYSUP_ONLY: "cmcc_rax3000m-emmc cmcc_xr30-emmc"
+  EXPECTED_N: "6"
+  TAG_PREFIX: immortalwrt-25.12-cmcc-standard
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 1500M
   CCACHE_COMPRESS: 'true'
@@ -49,7 +50,7 @@ env:
 
 jobs:
   build:
-    name: 🏗️ CMCC RAX3000M (eMMC)
+    name: 🏗️ CMCC RAX3000M + XR30 常规版 (NAND + eMMC)
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
@@ -121,9 +122,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cmcc-${{ env.DEVICE }}-${{ github.run_id }}
+          key: ccache-cmcc-standard-${{ github.run_id }}
           restore-keys: |
-            ccache-cmcc-${{ env.DEVICE }}-
+            ccache-cmcc-standard-
             ccache-filogic-
 
       - name: 注入 CMCC 四机型（dts / filogic.mk / platform.sh / 02_network）
@@ -180,7 +181,8 @@ jobs:
       - name: 生成 .config（只有本机型 + argon 主题 + iStore + 强制中文）
         run: |
           set -euo pipefail
-          KEEP="CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE}"
+          # 机型清单来源：NAND 双产物机型 + 只出 sysupgrade 的机型
+          DEV_LIST="$NAND_FULL $SYSUP_ONLY"
           : > .config
           cat >> .config <<'CFG'
           CONFIG_TARGET_mediatek=y
@@ -197,6 +199,7 @@ jobs:
           CONFIG_PACKAGE_luci-i18n-store-zh-cn=y
           CONFIG_PACKAGE_luci-theme-argon=y
           CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_kmod-mt7915e=y
           CFG
           sed -i 's/^          //' .config
           bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" config .config
@@ -205,22 +208,23 @@ jobs:
           # 只保留本机型：MULTI_PROFILE 会把 filogic 全部 profile 铺进 .config，
           # 逐行删掉非白名单的 =y 再统一追加 "is not set"（只追加 n 无效，
           # 已有的 =y 行先生效）
-          python3 - "$DEVICE" <<'PY'
+          python3 - $DEV_LIST <<'PY'
           import sys
-          keep = 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' + sys.argv[1]
+          keeps = {'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' + x for x in sys.argv[1:]}
           off, out = [], []
           for line in open('.config', encoding='utf-8', errors='surrogateescape'):
               name = line.split('=')[0].replace('# ', '').split(' ')[0]
-              if name.startswith('CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_') and name != keep:
+              if name.startswith('CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_') and name not in keeps:
                   off.append(name)
                   continue
               out.append(line)
           for n in dict.fromkeys(off):
               out.append('# %s is not set\n' % n)
+          for n in sorted(keeps):
+              out.append('%s=y\n' % n)
           open('.config', 'w', encoding='utf-8', errors='surrogateescape').writelines(out)
-          print('已关闭非本机型: %d 个' % len(off))
+          print('已关闭非目标机型: %d 个；保留 %d 台' % (len(off), len(keeps)))
           PY
-          grep -q "^${KEEP}=y$" .config || echo "${KEEP}=y" >> .config
           echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
           make defconfig
 
@@ -237,9 +241,11 @@ jobs:
           grep -q '^CONFIG_TARGET_mediatek=y$' .config || { echo "::error::target 未选中"; exit 1; }
           grep -q '^CONFIG_TARGET_mediatek_filogic=y$' .config || { echo "::error::subtarget filogic 未选中"; exit 1; }
           grep -q '^CONFIG_TARGET_MULTI_PROFILE=y$' .config || { echo "::error::MULTI_PROFILE 被丢弃"; exit 1; }
-          grep -q "^${KEEP}=y$" .config || { echo "::error::机型 ${DEVICE} 未生效"; exit 1; }
+          for d in $DEV_LIST; do
+            grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${d}=y$" .config || { echo "::error::机型 ${d} 未生效"; exit 1; }
+          done
           n_dev=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || true)
-          [ "${n_dev:-0}" -eq 1 ] || { echo "::error::启用机型应为 1 台，实际 ${n_dev}"; grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config; exit 1; }
+          [ "${n_dev:-0}" -eq 4 ] || { echo "::error::启用机型应为 4 台，实际 ${n_dev}"; grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config; exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-theme-argon=y$' .config || { echo "::error::argon 主题未启用"; exit 1; }
           # iStore / 中文包走 DEVICE_PACKAGES：kconfig 的 DEPENDS 是"要求"而非"自动选择"，
           # 只写 CONFIG_PACKAGE_luci-app-store=y 会被 defconfig 静默压成 n（首跑实测：
@@ -256,7 +262,22 @@ jobs:
           grep -q "luci.main.mediaurlbase='/luci-static/argon'" files/etc/uci-defaults/99-luci-theme-argon \
             || { echo "::error::默认主题不是 argon"; exit 1; }
           grep -q "CONFIG_SIGNED_PACKAGES is not set" .config || { echo "::error::包索引签名未关闭"; exit 1; }
-          echo "机型: ${DEVICE}（${FLAVOR}）/ 主题: argon / iStore + 简体中文包: 已注入 DEVICE_PACKAGES"
+          # ---- 无线保障（硬断言）：驱动包 + 固件包 + 首启增强脚本，任一缺失即失败 ----
+          grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y$' .config \
+            || { echo "::error::无线驱动 kmod-mt7915e 未选中，固件没 WiFi"; exit 1; }
+          grep -q 'kmod-mt7915e' target/linux/mediatek/image/filogic.mk \
+            || { echo "::error::filogic.mk 目标机型未带 kmod-mt7915e"; exit 1; }
+          grep -q 'mt7981-wo-firmware' target/linux/mediatek/image/filogic.mk \
+            || { echo "::error::filogic.mk 目标机型未带 mt7981-wo-firmware"; exit 1; }
+          test -f files/etc/uci-defaults/99-wifi-boost \
+            || { echo "::error::无线增强脚本 99-wifi-boost 缺失"; exit 1; }
+          grep -q "country='CN'" files/etc/uci-defaults/99-wifi-boost \
+            || { echo "::error::无线增强未设国码 CN"; exit 1; }
+          grep -q 'HE160' files/etc/uci-defaults/99-wifi-boost \
+            || { echo "::error::无线增强未开 5G HE160"; exit 1; }
+          grep -q "ieee80211r='1'" files/etc/uci-defaults/99-wifi-boost \
+            || { echo "::error::无线增强未开 802.11r 快速漫游"; exit 1; }
+          echo "机型: ${DEV_LIST} / 主题: argon / iStore + 中文 / 无线: mt7915e + wifi-boost"
 
       - name: 下载源码包
         run: |
@@ -293,7 +314,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-cmcc-rax3000m-emmc
+          name: build-log-cmcc-standard
           path: |
             build.log
             error.log
@@ -302,47 +323,46 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      - name: 收集产物（emmc 口径）
+      - name: 收集产物（nand 口径 · 多机型）
         id: collect
         run: |
           set -euo pipefail
           B=bin/targets/mediatek/filogic
           mkdir -p out
           shopt -s nullglob
-          for f in "$B"/*"${DEVICE}"-squashfs-factory.bin "$B"/*"${DEVICE}"-squashfs-sysupgrade.bin; do
-            cp -f "$f" out/
+          ALL="$NAND_FULL $SYSUP_ONLY"
+          for d in $ALL; do
+            for f in "$B"/*"${d}"-squashfs-factory.bin "$B"/*"${d}"-squashfs-sysupgrade.bin; do
+              cp -f "$f" out/
+            done
           done
-          echo "===== bin/targets 下本机型文件 ====="
-          ls -lh "$B"/*"${DEVICE}"* 2>/dev/null || true
+          echo "===== bin/targets 下本批机型文件 ====="
+          for d in $ALL; do ls -lh "$B"/*"${d}"* 2>/dev/null || true; done
           echo "===== out/ ====="
           ls -lh out || true
 
-          # nullglob 下必须用数组判断文件存在：直接 `ls out/*glob` 在无匹配时会
-          # 展开成空参数，`ls` 无参数返回 0，导致 "不该有 factory" 误判（曾致 eMMC run 失败）。
-          factory=( out/*"${DEVICE}"-squashfs-factory.bin )
-          sysup=( out/*"${DEVICE}"-squashfs-sysupgrade.bin )
-          if [ "$FLAVOR" = "emmc" ]; then
-            [ "${#sysup[@]}" -ge 1 ] \
-              || { echo "::error::eMMC 机型缺 sysupgrade.bin"; exit 1; }
-            [ "${#factory[@]}" -eq 0 ] \
-              || { echo "::error::eMMC 机型不该有 factory.bin"; exit 1; }
-            n=$(ls -1 out | wc -l)
-            [ "$n" -eq 1 ] || { echo "::error::eMMC 产物应只有 1 个 sysupgrade，实际 $n"; ls out; exit 1; }
-          else
-            [ "${#factory[@]}" -ge 1 ] \
-              || { echo "::error::NAND 机型缺 factory.bin"; exit 1; }
-            [ "${#sysup[@]}" -ge 1 ] \
-              || { echo "::error::NAND 机型缺 sysupgrade.bin"; exit 1; }
-            n=$(ls -1 out | wc -l)
-            [ "$n" -eq 2 ] || { echo "::error::NAND 产物应为 factory + sysupgrade 共 2 个，实际 $n"; ls out; exit 1; }
-          fi
+          # 数组展开计数判断存在性（nullglob 下 `ls glob` 无匹配会展开为空、ls 无参数返回 0，不可靠）
+          for d in $NAND_FULL; do
+            factory=( out/*"${d}"-squashfs-factory.bin )
+            sysup=( out/*"${d}"-squashfs-sysupgrade.bin )
+            [ "${#factory[@]}" -ge 1 ] || { echo "::error::${d} 缺 factory.bin"; ls out; exit 1; }
+            [ "${#sysup[@]}" -ge 1 ] || { echo "::error::${d} 缺 sysupgrade.bin"; ls out; exit 1; }
+          done
+          for d in $SYSUP_ONLY; do
+            factory=( out/*"${d}"-squashfs-factory.bin )
+            sysup=( out/*"${d}"-squashfs-sysupgrade.bin )
+            [ "${#factory[@]}" -eq 0 ] || { echo "::error::${d} 应为 sysupgrade-only（多分区/无 factory 口径），不该有 factory.bin"; ls out; exit 1; }
+            [ "${#sysup[@]}" -ge 1 ] || { echo "::error::${d} 缺 sysupgrade.bin"; ls out; exit 1; }
+          done
+          n=$(ls -1 out | wc -l)
+          [ "$n" -eq "${EXPECTED_N}" ] || { echo "::error::应产出 ${EXPECTED_N} 个固件，实际 $n"; ls out; exit 1; }
           # 引导工件硬性拒绝：出现 preloader / fip / gpt / itb 一律中止发布（防误刷变砖）
           if ls out/ | grep -qiE 'preloader|bl31|\.fip$|gpt|\.itb$'; then
             echo "::error::产物里出现引导工件或 itb，拒绝发布"; ls out; exit 1
           fi
           (cd out && sha256sum ./* > sha256sums.txt)
           {
-            echo "## 🏗️ CMCC RAX3000M (eMMC) 编译完成"
+            echo "## 🏗️ CMCC RAX3000M + XR30 常规版 (NAND + eMMC) 编译完成"
             echo ""
             echo "| 文件 | 大小 |"
             echo "|---|---|"
@@ -352,7 +372,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: images-cmcc-rax3000m-emmc
+          name: images-cmcc-standard
           path: out/
           retention-days: 14
           if-no-files-found: error
@@ -373,27 +393,28 @@ jobs:
             TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
           fi
           cat > notes.md <<'EOF'
-          ImmortalWrt 25.12 · CMCC RAX3000M（eMMC）自动编译
+          ImmortalWrt 25.12 · CMCC RAX3000M + XR30 常规版 (NAND + eMMC) 自动编译
 
-          - 源码: 本仓库 \`master\`（ImmortalWrt 25.12）+ tvliving/lede 移植的四机型补丁
-          - 机型: \`cmcc_rax3000m-emmc\`（emmc）
-          - 产物: 只有 `*-squashfs-sysupgrade.bin`（sysupgrade-tar 写 kernel/rootfs 两分区）
+          - 源码: 本仓库 \`master\`（ImmortalWrt 25.12）+ tvliving/lede 派生的机型补丁
+          - 机型: NAND：`cmcc_rax3000m-nand` + `cmcc_xr30-nand`；eMMC：`cmcc_rax3000m-emmc` + `cmcc_xr30-emmc`
+          - 产物: NAND 两台 factory+sysupgrade；eMMC 两台只有 sysupgrade
           - 引导: **沿用机器现有 U-Boot，不刷 preloader / fip / gpt**
           - 界面: argon 主题 + iStore 软件市场 + 强制简体中文（默认语言 zh_cn）
+          - 无线: mt7915e 驱动 + mt7981-wo-firmware；首启 99-wifi-boost 自动增强（国码 CN / 5G 160MHz / 2.4G HE40 / 802.11k v r）
           - 默认 IP: 192.168.1.1 / 用户名 root / 无密码
-          - 定时: 每周一 08:10（北京时间）自动编译，比 build-mediatek 晚 5 小时
+          - 定时: 每周一 08:10（北京时间）自动编译
           - 工作流: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           ### 刷机提示
 
-          1. 只有 sysupgrade：要求 eMMC 上已是 lede 那套分区布局（GPT 有 `kernel`、`rootfs`）；
-               LuCI 上传或 `sysupgrade -n` 即可，跨发行版建议不保留配置
-            2. eMMC 被清空 / 换片时，先用 lede 的 gpt + preloader + fip 恢复再刷本包
+          1. NAND 机型（RAX3000M / XR30）：首次刷 `*-squashfs-factory.bin`，升级刷 `*-squashfs-sysupgrade.bin`
+          2. eMMC 机型（RAX3000M / XR30）：只有 `*-squashfs-sysupgrade.bin`，系统内升级即可
+          3. 本页不含任何引导工件，preloader / fip 请沿用机器现有 U-Boot
           EOF
           for i in 1 2 3 4 5; do
             echo ">>> 第 $i 次上传"
             if ! gh release view "$TAG" >/dev/null 2>&1; then
-              gh release create "$TAG" --title "ImmortalWrt 25.12 CMCC RAX3000M (eMMC) ${DATE}" --notes-file notes.md || true
+              gh release create "$TAG" --title "ImmortalWrt 25.12 · CMCC RAX3000M + XR30 常规版 (NAND + eMMC) ${DATE}" --notes-file notes.md || true
             fi
             if gh release upload "$TAG" out/* --clobber; then
               echo ">>> 上传成功（第 $i 次）"
