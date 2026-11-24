@@ -1,0 +1,394 @@
+# ImmortalWrt 25.12 · SL-3000 eMMC 单机型编译
+#
+# 机型：SL-3000 eMMC（MT7981B，1GB RAM，32MB NOR + 128GB eMMC）
+#
+# 采用 25.12 适配 DTS（mt7981b.dtsi / root=PARTLABEL=rootfs / eMMC block-device），
+# 由 .github/scripts/sl3000-inject.sh 注入：
+#   - filogic.mk：sl_3000-emmc，仅 sysupgrade（不产 factory）
+#   - 02_network：lan1 lan2 lan3 + wan（MT7531 switch）
+#   - 11_fix_wifi_mac：eMMC factory 0x04 派生双频 MAC
+#   - platform.sh：eMMC 升级/复制配置路由
+#   - 双频无线：SL3000-2.4G / SL3000-5G，首启开启
+#
+# 界面：argon + iStore 市场 + 全量简体中文 + 强制 zh_cn。
+# 无线：kmod-mt7915e + kmod-mt7981-firmware + mt7981-wo-firmware，
+#   99-wifi-boost：CN / 5G HE160 / 2.4G HE40 / 802.11k v r / beamformee。
+#
+# 定时：每周一 08:40（北京时间）。
+name: ImmortalWrt 25.12 · SL-3000 eMMC
+
+on:
+  schedule:
+    # UTC 周一 00:40 = 北京周一 08:40
+    - cron: '40 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: '编译完成后发布 Release'
+        type: boolean
+        default: true
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/immortalwrt-sl3000-emmc.yml'
+      - '.github/scripts/sl3000-inject.sh'
+      - '.github/sl3000/**'
+permissions:
+  contents: write
+
+concurrency:
+  group: immortalwrt-sl3000-emmc
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  SYSUP_ONLY: "sl_3000-emmc"
+  EXPECTED_N: "1"
+  TAG_PREFIX: immortalwrt-25.12-sl3000-emmc
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1500M
+  CCACHE_COMPRESS: 'true'
+  CCACHE_NOHASHDIR: 'true'
+
+jobs:
+  build:
+    name: 🏗️ SL-3000 eMMC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放磁盘空间并加大 swap
+        run: |
+          echo "===== 释放前 ====="
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/local/lib/node_modules /usr/lib/jvm \
+                      /usr/share/swift /usr/share/miniconda /usr/share/rust \
+                      /usr/share/kotlinc /usr/share/gradle-* /opt/az \
+                      /opt/microsoft /usr/local/aws-cli /usr/local/.ghcup \
+                      /etc/mysql /etc/php /usr/local/go /opt/pipx 2>/dev/null || true
+          sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
+          sudo pkill -9 -f dockerd 2>/dev/null || true
+          sudo pkill -9 -f containerd 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /snap /var/lib/snapd 2>/dev/null || true
+          sudo journalctl --vacuum-size=32M 2>/dev/null || true
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          if sudo fallocate -l 4G /swapfile 2>/dev/null; then
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null 2>&1 && sudo swapon /swapfile && echo ">>> swap 4G 已启用"
+          else
+            echo "::warning::swap 创建失败，继续"
+          fi
+          echo "===== 释放后 ====="
+          df -h / | tail -1
+          free -h
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get update -qq -o Acquire::Retries=3 || sudo -E apt-get update -qq
+          for i in 1 2 3; do
+            if timeout 1500 sudo -E apt-get install -y --no-install-recommends \
+              ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+              build-essential bzip2 ccache clang cmake cpio curl \
+              device-tree-compiler flex gawk gcc-multilib g++-multilib \
+              genisoimage gettext git gperf haveged help2man intltool \
+              libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+              libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+              libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
+              libssl-dev libtool libxslt1-dev lld llvm lrzsz msmtp ninja-build \
+              p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
+              python3-setuptools qemu-utils rsync scons squashfs-tools \
+              subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto \
+              xxd zlib1g-dev; then
+              echo ">>> 依赖安装完成"
+              break
+            fi
+            echo ">>> 第 $i 次安装失败，30 秒后重试"
+            sleep 30
+          done
+          ccache --version | head -1 || echo "::warning::ccache 不可用"
+
+      - name: 恢复 ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-sl3000-emmc-${{ github.run_id }}
+          restore-keys: |
+            ccache-sl3000-emmc-
+            ccache-filogic-
+
+      - name: 注入 SL-3000 eMMC（DTS / Device / 网口 / MAC / 无线）
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/sl3000-inject.sh"
+
+      - name: 更新并安装 feeds（含 iStore 市场）
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" feed
+          for i in 1 2 3; do
+            if ./scripts/feeds update -a && ./scripts/feeds install -a; then
+              echo ">>> feeds 完成"
+              break
+            fi
+            echo ">>> 第 $i 次 feeds 失败，20 秒后重试"
+            rm -rf feeds
+            sleep 20
+            [ "$i" = "3" ] && exit 1
+          done
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" store
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" theme
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" collections
+
+      - name: 修补 libffi InstallDev（对齐官方 25.12）
+        shell: bash
+        run: |
+          f=feeds/packages/libs/libffi/Makefile
+          if [ ! -f "$f" ]; then echo ">>> 无 $f，跳过"; exit 0; fi
+          if ! grep -qF 'fficonfig.h' "$f"; then
+            echo ">>> libffi 无需处理"; exit 0
+          fi
+          python3 - "$f" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p, encoding="utf-8").read()
+          pats = [
+              re.compile(r"\t\$\(CP\) \\\n\t\t\$\(PKG_BUILD_DIR\)/\$\(GNU_TARGET_NAME\)\*/fficonfig\.h \\\n\t\t\$\(1\)/usr/include/\n"),
+              re.compile(r"\t@ffi=[^\n]*\\\n\tif \[ -n \"\$+ffi\" \]; then[^\n]*\\\n\telse echo [^\n]*\n"),
+          ]
+          n = 0
+          for pat in pats:
+              s, k = pat.subn("", s)
+              n += k
+          if n == 0:
+              print("SKIP: 未匹配到 fficonfig.h 拷贝段")
+              sys.exit(1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("PATCHED: %d 段" % n)
+          PY
+          exit 0
+
+      - name: 生成 .config（SL-3000 + argon + iStore + 强制中文）
+        run: |
+          set -euo pipefail
+          : > .config
+          cat >> .config <<'CFG'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_libmbedtls=y
+          CONFIG_PACKAGE_libustream-mbedtls=y
+          # CONFIG_SIGNED_PACKAGES is not set
+          # CONFIG_SIGNATURE_CHECK is not set
+          CONFIG_PACKAGE_luci-app-store=y
+          CONFIG_PACKAGE_luci-i18n-store-zh-cn=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_kmod-mt7915e=y
+          CFG
+          sed -i 's/^          //' .config
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" config .config
+          make defconfig
+
+          python3 - "$SYSUP_ONLY" <<'PY'
+          import sys
+          keep = 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' + sys.argv[1]
+          off, out = [], []
+          for line in open('.config', encoding='utf-8', errors='surrogateescape'):
+              name = line.split('=')[0].replace('# ', '').split(' ')[0]
+              if name.startswith('CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_') and name != keep:
+                  off.append(name)
+                  continue
+              out.append(line)
+          for n in dict.fromkeys(off):
+              out.append('# %s is not set\n' % n)
+          out.append('%s=y\n' % keep)
+          open('.config', 'w', encoding='utf-8', errors='surrogateescape').writelines(out)
+          print('已关闭非目标机型: %d 个' % len(off))
+          PY
+          echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
+          make defconfig
+
+          awk '/^[[:space:]]*config PACKAGE_luci-i18n-.+-zh-cn$/{print "CONFIG_"$2"=y"}' tmp/.config-package.in >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+          make defconfig
+
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" uci-defaults
+
+          echo "===== 校验 ====="
+          grep -q '^CONFIG_TARGET_mediatek=y$' .config || { echo "::error::target 未选中"; exit 1; }
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y$' .config || { echo "::error::subtarget 未选中"; exit 1; }
+          grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_sl_3000-emmc=y$" .config || { echo "::error::SL3000 未选中"; exit 1; }
+          n_dev=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || true)
+          [ "${n_dev:-0}" -eq 1 ] || { echo "::error::启用机型应为 1，实际 ${n_dev}"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-theme-argon=y$' .config || { echo "::error::argon 未启用"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config || { echo "::error::iStore 未选中"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-i18n-base-zh-cn=y$' .config || { echo "::error::中文包未选中"; exit 1; }
+          grep -q '^CONFIG_LUCI_LANG_zh_Hans=y$' .config || { echo "::error::中文开关未启用"; exit 1; }
+          grep -q "luci.main.lang='zh_cn'" files/etc/uci-defaults/99-luci-lang-zh-cn || { echo "::error::默认语言不是 zh_cn"; exit 1; }
+          grep -q "luci.main.mediaurlbase='/luci-static/argon'" files/etc/uci-defaults/99-luci-theme-argon || { echo "::error::默认主题不是 argon"; exit 1; }
+          grep -q "CONFIG_SIGNED_PACKAGES is not set" .config || { echo "::error::签名关闭失败"; exit 1; }
+
+          # WiFi 包 + 设备块精确校验
+          grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y$' .config || { echo "::error::mt7915e 未选中"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_kmod-mt7981-firmware=y$' .config || { echo "::error::MT7981 firmware 未选中"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_mt7981-wo-firmware=y$' .config || { echo "::error::MT7981 wo-firmware 未选中"; exit 1; }
+          python3 - <<'PY'
+          s = open('target/linux/mediatek/image/filogic.mk', encoding='utf-8').read()
+          b = s[s.index('define Device/sl_3000-emmc'):s.index('TARGET_DEVICES += sl_3000-emmc')]
+          for p in ('kmod-mt7915e', 'kmod-mt7981-firmware', 'mt7981-wo-firmware',
+                    'luci-app-store', 'luci-i18n-base-zh-cn'):
+              assert p in b, 'DEVICE_PACKAGES 缺 ' + p
+          print('✔ SL3000 DEVICE_PACKAGES 校验通过')
+          PY
+
+          # 网口/WiFi 硬断言（注入脚本已做，这里再在最终 .config 阶段复核）
+          grep -q 'ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" wan' target/linux/mediatek/filogic/base-files/etc/board.d/02_network \
+            || { echo "::error::网口映射不是 lan1-3 + wan"; exit 1; }
+          grep -q 'sl,3000-emmc' target/linux/mediatek/filogic/base-files/etc/hotplug.d/ieee80211/11_fix_wifi_mac \
+            || { echo "::error::WiFi MAC 规则缺失"; exit 1; }
+          test -f files/etc/config/wireless || { echo "::error::无线配置缺失"; exit 1; }
+          grep -q "option path 'platform/soc/18000000.wifi'" files/etc/config/wireless || { echo "::error::缺 2.4G radio"; exit 1; }
+          grep -q "option path 'platform/soc/18000000.wifi+1'" files/etc/config/wireless || { echo "::error::缺 5G radio"; exit 1; }
+          grep -q "option ssid 'SL3000-2.4G'" files/etc/config/wireless || { echo "::error::缺 2.4G AP"; exit 1; }
+          grep -q "option ssid 'SL3000-5G'" files/etc/config/wireless || { echo "::error::缺 5G AP"; exit 1; }
+          grep -q "option disabled '0'" files/etc/config/wireless || { echo "::error::无线仍 disabled"; exit 1; }
+          test -f files/etc/uci-defaults/99-wifi-boost || { echo "::error::99-wifi-boost 缺失"; exit 1; }
+          grep -q "country='CN'" files/etc/uci-defaults/99-wifi-boost || { echo "::error::无线国码不是 CN"; exit 1; }
+          grep -q 'HE160' files/etc/uci-defaults/99-wifi-boost || { echo "::error::5G 未开 HE160"; exit 1; }
+          grep -q "ieee80211r='1'" files/etc/uci-defaults/99-wifi-boost || { echo "::error::未开 802.11r"; exit 1; }
+          echo "机型: $SYSUP_ONLY / 主题: argon / iStore + 中文 / 网口: lan1-3+wan / 双频无线: 首启开启"
+
+      - name: 下载源码包
+        run: |
+          for i in 1 2 3; do
+            if make -j8 download < /dev/null; then
+              echo ">>> 下载完成"
+              break
+            fi
+            echo ">>> 第 $i 次下载有失败项，重试"
+            sleep 15
+          done
+          make -j1 download < /dev/null 2>&1 | tail -20 || true
+
+      - name: 编译固件
+        run: |
+          export CCACHE_DIR CCACHE_MAXSIZE CCACHE_COMPRESS CCACHE_NOHASHDIR
+          mkdir -p "$CCACHE_DIR"
+          ccache -s 2>/dev/null || true
+          set -o pipefail
+          echo ">>> 并行编译 make -j$(nproc)"
+          if make -j"$(nproc)" 2>&1 | tee build.log; then
+            echo ">>> ✅ 编译成功"
+          else
+            echo "::warning::并行编译失败，单线程复现"
+            make -j1 V=s 2>&1 | tee -a error.log || true
+            tail -150 error.log || true
+            exit 1
+          fi
+          ccache -s 2>/dev/null || true
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-sl3000-emmc
+          path: |
+            build.log
+            error.log
+            .config
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: 收集产物（仅 sysupgrade.bin）
+        run: |
+          set -euo pipefail
+          B=bin/targets/mediatek/filogic
+          mkdir -p out
+          shopt -s nullglob
+          for f in "$B"/*"${SYSUP_ONLY}"-squashfs-sysupgrade.bin; do
+            cp -f "$f" out/
+          done
+          sysup=( out/*"${SYSUP_ONLY}"-squashfs-sysupgrade.bin )
+          factory=( out/*"${SYSUP_ONLY}"-squashfs-factory.* )
+          [ "${#sysup[@]}" -ge 1 ] || { echo "::error::缺 sysupgrade.bin"; ls -lh "$B" || true; exit 1; }
+          [ "${#factory[@]}" -eq 0 ] || { echo "::error::SL3000 eMMC 不应有 factory"; ls out; exit 1; }
+          n=$(ls -1 out | wc -l)
+          [ "$n" -eq "${EXPECTED_N}" ] || { echo "::error::应产出 ${EXPECTED_N} 个固件，实际 $n"; ls out; exit 1; }
+          if ls out/ | grep -qiE 'preloader|bl31|\.fip$|gpt|initramfs|recovery'; then
+            echo "::error::产物里出现引导工件，拒绝发布"; ls out; exit 1
+          fi
+          (cd out && sha256sum ./* > sha256sums.txt)
+          {
+            echo "## 🏗️ SL-3000 eMMC 编译完成"
+            echo ""
+            echo "| 文件 | 大小 |"
+            echo "|---|---|"
+            ls -lh out | tail -n +2 | awk '{printf "| %s | %s |\n", $9, $5}'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-sl3000-emmc
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.make_release != false) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          DATE=$(TZ=Asia/Shanghai date +%Y%m%d)
+          TAG="${TAG_PREFIX}-${DATE}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
+          fi
+          cat > notes.md <<'EOF'
+          ImmortalWrt 25.12 · SL-3000 eMMC 自动编译
+
+          - 机型: `sl_3000-emmc`（MT7981B，1GB RAM，32MB NOR + 128GB eMMC）
+          - 产物: 只有 `*-squashfs-sysupgrade.bin`，不含 factory，也不含 preloader/fip/gpt
+          - 网口: MT7531 `lan1 lan2 lan3` + `wan`
+          - 界面: argon 主题 + iStore 市场 + 全量简体中文（默认 zh_cn）
+          - 无线: mt7915e + MT7981 firmware；首启 `SL3000-2.4G` / `SL3000-5G` 双频 AP
+          - 无线增强: CN 国码 / 5G HE160 / 2.4G HE40 / 802.11k v r / beamformee
+          - 默认 IP: 192.168.1.1 / root / 无密码
+          - 定时: 每周一 08:40（北京时间）
+          - 工作流: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### 刷机提示
+
+          1. eMMC 机型：系统内刷 `*-squashfs-sysupgrade.bin`；首次从原厂刷入请先备份 eMMC 分区并确认 U-Boot 可用。
+          2. 本页不含引导工件；无线首启开启，刷入后请立即设置密码。
+          EOF
+          for i in 1 2 3 4 5; do
+            echo ">>> 第 $i 次上传"
+            if ! gh release view "$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" --title "ImmortalWrt 25.12 · SL-3000 eMMC ${DATE}" --notes-file notes.md || true
+            fi
+            if gh release upload "$TAG" out/* --clobber; then
+              echo ">>> 上传成功（第 $i 次）"
+              exit 0
+            fi
+            echo ">>> 第 $i 次失败，$((i*30)) 秒后重试"
+            sleep $((i*30))
+          done
+          echo "::error::Release 上传失败，产物已保留在 Actions artifact"
+          exit 1
