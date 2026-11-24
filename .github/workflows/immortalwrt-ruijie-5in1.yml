@@ -1,0 +1,482 @@
+# ImmortalWrt 25.12 · Ruijie 5 机型定时构建
+#
+# 机型：EW-6000GX PRO、RG-X60 New、RG-X30E Pro、RG-X30E、RG-BE72 Pro (DSA mod)
+#
+# 设计：
+#   - 一个 workflow + matrix，每台机型单独 runner/job，避免不同 DTS/无线路径互相覆盖。
+#   - DTS、Device 块、02_network 网口映射、WiFi MAC 规则全部由
+#     .github/scripts/ruijie-5in1-inject.sh 注入，源文件在 .github/ruijie/dts/。
+#   - 每台机型都做网口/WiFi 硬断言；任何一项不符直接失败，不产出“看起来成功但没网”的固件。
+#   - argon 主题 + iStore 市场 + 全量简体中文包 + 强制 zh_cn。
+#   - 无线：mt7915e/mt7992 + 对应 wo-firmware；首启双频 AP + 99-wifi-boost。
+#
+# 产物：每台机型只发 *-squashfs-sysupgrade.bin；不发 preloader/fip/gpt。
+# 定时：每周一 08:30（北京时间）。
+name: ImmortalWrt 25.12 · Ruijie 5-in-1
+
+on:
+  schedule:
+    # UTC 周一 00:30 = 北京周一 08:30
+    - cron: '30 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: '编译完成后发布 Release'
+        type: boolean
+        default: true
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/immortalwrt-ruijie-5in1.yml'
+      - '.github/scripts/ruijie-5in1-inject.sh'
+      - '.github/ruijie/**'
+permissions:
+  contents: write
+
+concurrency:
+  group: immortalwrt-ruijie-5in1
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  TAG_PREFIX: immortalwrt-25.12-ruijie-5in1
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1500M
+  CCACHE_COMPRESS: 'true'
+  CCACHE_NOHASHDIR: 'true'
+
+jobs:
+  build:
+    name: 🏗️ ${{ matrix.title }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - device: ruijie_rg-ew6000gx-pro
+            title: EW-6000GX PRO (MT7986A)
+            wifi_mode: path
+            wifi_2g: platform/soc/18000000.wifi
+            wifi_5g: platform/soc/18000000.wifi+1
+            ssid_2g: EW6000GX-2.4G
+            ssid_5g: EW6000GX-5G
+          - device: ruijie_rg-x60-new
+            title: RG-X60 New (MT7986A)
+            wifi_mode: path
+            wifi_2g: platform/soc/18000000.wifi
+            wifi_5g: platform/soc/18000000.wifi+1
+            ssid_2g: X60NEW-2.4G
+            ssid_5g: X60NEW-5G
+          - device: ruijie_rg-x30e-pro
+            title: RG-X30E Pro (MT7981B)
+            wifi_mode: path
+            wifi_2g: platform/soc/18000000.wifi
+            wifi_5g: platform/soc/18000000.wifi+1
+            ssid_2g: X30EPRO-2.4G
+            ssid_5g: X30EPRO-5G
+          - device: ruijie_rg-x30e
+            title: RG-X30E (MT7981B)
+            wifi_mode: path
+            wifi_2g: platform/soc/18000000.wifi
+            wifi_5g: platform/soc/18000000.wifi+1
+            ssid_2g: X30E-2.4G
+            ssid_5g: X30E-5G
+          - device: ruijie_rg-be72-pro-dsa-mod
+            title: RG-BE72 Pro (MT7988D DSA)
+            wifi_mode: phy
+            wifi_2g: phy0
+            wifi_5g: phy1
+            ssid_2g: BE72PRO-2.4G
+            ssid_5g: BE72PRO-5G
+
+    env:
+      RU_DEVICE: ${{ matrix.device }}
+      RU_WIFI_MODE: ${{ matrix.wifi_mode }}
+      RU_WIFI_2G: ${{ matrix.wifi_2g }}
+      RU_WIFI_5G: ${{ matrix.wifi_5g }}
+      RU_SSID_2G: ${{ matrix.ssid_2g }}
+      RU_SSID_5G: ${{ matrix.ssid_5g }}
+
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放磁盘空间并加大 swap
+        run: |
+          echo "===== 释放前 ====="
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/local/lib/node_modules /usr/lib/jvm \
+                      /usr/share/swift /usr/share/miniconda /usr/share/rust \
+                      /usr/share/kotlinc /usr/share/gradle-* /opt/az \
+                      /opt/microsoft /usr/local/aws-cli /usr/local/.ghcup \
+                      /etc/mysql /etc/php /usr/local/go /opt/pipx 2>/dev/null || true
+          sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
+          sudo pkill -9 -f dockerd 2>/dev/null || true
+          sudo pkill -9 -f containerd 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /snap /var/lib/snapd 2>/dev/null || true
+          sudo journalctl --vacuum-size=32M 2>/dev/null || true
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          if sudo fallocate -l 4G /swapfile 2>/dev/null; then
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null 2>&1 && sudo swapon /swapfile && echo ">>> swap 4G 已启用"
+          else
+            echo "::warning::swap 创建失败，继续"
+          fi
+          echo "===== 释放后 ====="
+          df -h / | tail -1
+          free -h
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get update -qq -o Acquire::Retries=3 || sudo -E apt-get update -qq
+          for i in 1 2 3; do
+            if timeout 1500 sudo -E apt-get install -y --no-install-recommends \
+              ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+              build-essential bzip2 ccache clang cmake cpio curl \
+              device-tree-compiler flex gawk gcc-multilib g++-multilib \
+              genisoimage gettext git gperf haveged help2man intltool \
+              libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+              libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+              libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
+              libssl-dev libtool libxslt1-dev lld llvm lrzsz msmtp ninja-build \
+              p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
+              python3-setuptools qemu-utils rsync scons squashfs-tools \
+              subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto \
+              xxd zlib1g-dev; then
+              echo ">>> 依赖安装完成"
+              break
+            fi
+            echo ">>> 第 $i 次安装失败，30 秒后重试"
+            sleep 30
+          done
+          ccache --version | head -1 || echo "::warning::ccache 不可用"
+
+      - name: 恢复 ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-ruijie-5in1-${{ matrix.device }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-ruijie-5in1-${{ matrix.device }}-
+            ccache-filogic-
+
+      - name: 注入 Ruijie 5 机型（DTS / Device / 网口 / WiFi MAC / 本机无线配置）
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/ruijie-5in1-inject.sh"
+
+      - name: 更新并安装 feeds（含 iStore 市场）
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" feed
+          for i in 1 2 3; do
+            if ./scripts/feeds update -a && ./scripts/feeds install -a; then
+              echo ">>> feeds 完成"
+              break
+            fi
+            echo ">>> 第 $i 次 feeds 失败，20 秒后重试"
+            rm -rf feeds
+            sleep 20
+            [ "$i" = "3" ] && exit 1
+          done
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" store
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" theme
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" collections
+
+      - name: 修补 libffi InstallDev（对齐官方 25.12）
+        shell: bash
+        run: |
+          f=feeds/packages/libs/libffi/Makefile
+          if [ ! -f "$f" ]; then echo ">>> 无 $f，跳过"; exit 0; fi
+          if ! grep -qF 'fficonfig.h' "$f"; then
+            echo ">>> libffi 无需处理"; exit 0
+          fi
+          python3 - "$f" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p, encoding="utf-8").read()
+          pats = [
+              re.compile(r"\t\$\(CP\) \\\n\t\t\$\(PKG_BUILD_DIR\)/\$\(GNU_TARGET_NAME\)\*/fficonfig\.h \\\n\t\t\$\(1\)/usr/include/\n"),
+              re.compile(r"\t@ffi=[^\n]*\\\n\tif \[ -n \"\$+ffi\" \]; then[^\n]*\\\n\telse echo [^\n]*\n"),
+          ]
+          n = 0
+          for pat in pats:
+              s, k = pat.subn("", s)
+              n += k
+          if n == 0:
+              print("SKIP: 未匹配到 fficonfig.h 拷贝段")
+              sys.exit(1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("PATCHED: %d 段" % n)
+          PY
+          exit 0
+
+      - name: 生成 .config（${{ matrix.title }} + argon + iStore + 强制中文）
+        run: |
+          set -euo pipefail
+          : > .config
+          cat >> .config <<'CFG'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_libmbedtls=y
+          CONFIG_PACKAGE_libustream-mbedtls=y
+          # CONFIG_SIGNED_PACKAGES is not set
+          # CONFIG_SIGNATURE_CHECK is not set
+          CONFIG_PACKAGE_luci-app-store=y
+          CONFIG_PACKAGE_luci-i18n-store-zh-cn=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CFG
+          sed -i 's/^          //' .config
+          if [ "$RU_DEVICE" = "ruijie_rg-be72-pro-dsa-mod" ]; then
+            echo 'CONFIG_PACKAGE_kmod-dsa-rtl837x=y' >> .config
+          else
+            echo 'CONFIG_PACKAGE_kmod-mt7915e=y' >> .config
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" config .config
+          make defconfig
+
+          python3 - "$RU_DEVICE" <<'PY'
+          import sys
+          keep = 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' + sys.argv[1]
+          off, out = [], []
+          for line in open('.config', encoding='utf-8', errors='surrogateescape'):
+              name = line.split('=')[0].replace('# ', '').split(' ')[0]
+              if name.startswith('CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_') and name != keep:
+                  off.append(name)
+                  continue
+              out.append(line)
+          for n in dict.fromkeys(off):
+              out.append('# %s is not set\n' % n)
+          out.append('%s=y\n' % keep)
+          open('.config', 'w', encoding='utf-8', errors='surrogateescape').writelines(out)
+          print('已关闭非目标机型: %d 个' % len(off))
+          PY
+          echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
+          make defconfig
+
+          awk '/^[[:space:]]*config PACKAGE_luci-i18n-.+-zh-cn$/{print "CONFIG_"$2"=y"}' tmp/.config-package.in >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+          make defconfig
+
+          bash "$GITHUB_WORKSPACE/.github/scripts/vendor.sh" uci-defaults
+
+          echo "===== 校验 ====="
+          grep -q '^CONFIG_TARGET_mediatek=y$' .config || { echo "::error::target 未选中"; exit 1; }
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y$' .config || { echo "::error::subtarget 未选中"; exit 1; }
+          grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${RU_DEVICE}=y$" .config || { echo "::error::机型 ${RU_DEVICE} 未生效"; exit 1; }
+          n_dev=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || true)
+          [ "${n_dev:-0}" -eq 1 ] || { echo "::error::启用机型应为 1，实际 ${n_dev}"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-theme-argon=y$' .config || { echo "::error::argon 未启用"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-app-store=y$' .config || { echo "::error::iStore 市场未选中"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-i18n-base-zh-cn=y$' .config || { echo "::error::中文基础包未选中"; exit 1; }
+          grep -q '^CONFIG_LUCI_LANG_zh_Hans=y$' .config || { echo "::error::中文开关未启用"; exit 1; }
+          grep -q "luci.main.lang='zh_cn'" files/etc/uci-defaults/99-luci-lang-zh-cn || { echo "::error::默认语言不是 zh_cn"; exit 1; }
+          grep -q "luci.main.mediaurlbase='/luci-static/argon'" files/etc/uci-defaults/99-luci-theme-argon || { echo "::error::默认主题不是 argon"; exit 1; }
+          grep -q "CONFIG_SIGNED_PACKAGES is not set" .config || { echo "::error::签名关闭失败"; exit 1; }
+
+          # 本机型 DEVICE_PACKAGES 精确校验
+          python3 - "$RU_DEVICE" <<'PY'
+          import sys
+          dev = sys.argv[1]
+          s = open('target/linux/mediatek/image/filogic.mk', encoding='utf-8').read()
+          blk = s[s.index('define Device/' + dev):s.index('TARGET_DEVICES += ' + dev, s.index('define Device/' + dev))]
+          need = ['luci-app-store', 'luci-i18n-base-zh-cn']
+          if dev == 'ruijie_rg-be72-pro-dsa-mod':
+              need += ['kmod-mt7992-firmware', 'mt7988-wo-firmware', 'kmod-dsa-rtl837x']
+          elif dev.startswith('ruijie_rg-x30e'):
+              need += ['kmod-mt7915e', 'kmod-mt7981-firmware', 'mt7981-wo-firmware']
+          else:
+              need += ['kmod-mt7915e', 'kmod-mt7986-firmware', 'mt7986-wo-firmware']
+          for n in need:
+              assert n in blk, 'DEVICE_PACKAGES 缺 ' + n
+          print('✔ DEVICE_PACKAGES:', dev)
+          PY
+
+          if [ "$RU_DEVICE" = "ruijie_rg-be72-pro-dsa-mod" ]; then
+            grep -q '^CONFIG_PACKAGE_kmod-dsa-rtl837x=y$' .config || { echo "::error::RTL8372N DSA 驱动未选中"; exit 1; }
+            grep -q '^CONFIG_PACKAGE_kmod-mt7992-firmware=y$' .config || { echo "::error::MT7992 固件未选中"; exit 1; }
+            grep -q '^CONFIG_PACKAGE_kmod-mt7992-23-firmware=y$' .config || { echo "::error::MT7992-23 固件未选中"; exit 1; }
+            grep -q '^CONFIG_PACKAGE_mt7988-wo-firmware=y$' .config || { echo "::error::MT7988 wo-firmware 未选中"; exit 1; }
+          else
+            grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y$' .config || { echo "::error::mt7915e 未选中"; exit 1; }
+            case "$RU_DEVICE" in
+              ruijie_rg-x30e|ruijie_rg-x30e-pro)
+                grep -q '^CONFIG_PACKAGE_kmod-mt7981-firmware=y$' .config || { echo "::error::MT7981 firmware 未选中"; exit 1; }
+                grep -q '^CONFIG_PACKAGE_mt7981-wo-firmware=y$' .config || { echo "::error::MT7981 wo-firmware 未选中"; exit 1; }
+                ;;
+              *)
+                grep -q '^CONFIG_PACKAGE_kmod-mt7986-firmware=y$' .config || { echo "::error::MT7986 firmware 未选中"; exit 1; }
+                grep -q '^CONFIG_PACKAGE_mt7986-wo-firmware=y$' .config || { echo "::error::MT7986 wo-firmware 未选中"; exit 1; }
+                grep -q '^CONFIG_PACKAGE_kmod-phy-airoha-en8811h=y$' .config || { echo "::error::2.5G WAN PHY 驱动未选中"; exit 1; }
+                ;;
+            esac
+          fi
+
+          # 无线/WiFi 硬断言
+          test -f files/etc/config/wireless || { echo "::error::无线配置缺失"; exit 1; }
+          grep -q "option ssid '${RU_SSID_2G}'" files/etc/config/wireless || { echo "::error::缺 2.4G AP"; exit 1; }
+          grep -q "option ssid '${RU_SSID_5G}'" files/etc/config/wireless || { echo "::error::缺 5G AP"; exit 1; }
+          grep -q "option disabled '0'" files/etc/config/wireless || { echo "::error::无线仍 disabled"; exit 1; }
+          test -f files/etc/uci-defaults/99-wifi-boost || { echo "::error::99-wifi-boost 缺失"; exit 1; }
+          grep -q "country='CN'" files/etc/uci-defaults/99-wifi-boost || { echo "::error::无线国码不是 CN"; exit 1; }
+          grep -q 'HE160' files/etc/uci-defaults/99-wifi-boost || { echo "::error::5G 未开 HE160"; exit 1; }
+          grep -q "ieee80211r='1'" files/etc/uci-defaults/99-wifi-boost || { echo "::error::未开 802.11r"; exit 1; }
+          echo "机型: $RU_DEVICE / 主题: argon / iStore + 中文 / 双频无线: 首启开启"
+
+      - name: 下载源码包
+        run: |
+          for i in 1 2 3; do
+            if make -j8 download < /dev/null; then
+              echo ">>> 下载完成"
+              break
+            fi
+            echo ">>> 第 $i 次下载有失败项，重试"
+            sleep 15
+          done
+          make -j1 download < /dev/null 2>&1 | tail -20 || true
+
+      - name: 编译固件
+        run: |
+          export CCACHE_DIR CCACHE_MAXSIZE CCACHE_COMPRESS CCACHE_NOHASHDIR
+          mkdir -p "$CCACHE_DIR"
+          ccache -s 2>/dev/null || true
+          set -o pipefail
+          echo ">>> 并行编译 make -j$(nproc)"
+          if make -j"$(nproc)" 2>&1 | tee build.log; then
+            echo ">>> ✅ 编译成功"
+          else
+            echo "::warning::并行编译失败，单线程复现"
+            make -j1 V=s 2>&1 | tee -a error.log || true
+            tail -150 error.log || true
+            exit 1
+          fi
+          ccache -s 2>/dev/null || true
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.device }}
+          path: |
+            build.log
+            error.log
+            .config
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: 收集本机型产物
+        run: |
+          set -euo pipefail
+          B=bin/targets/mediatek/filogic
+          mkdir -p out
+          shopt -s nullglob
+          for f in "$B"/*"${RU_DEVICE}"-squashfs-sysupgrade.bin; do
+            cp -f "$f" out/
+          done
+          sysup=( out/*"${RU_DEVICE}"-squashfs-sysupgrade.bin )
+          factory=( out/*"${RU_DEVICE}"-squashfs-factory.* )
+          [ "${#sysup[@]}" -ge 1 ] || { echo "::error::${RU_DEVICE} 缺 sysupgrade.bin"; ls -lh "$B" || true; exit 1; }
+          [ "${#factory[@]}" -eq 0 ] || { echo "::error::${RU_DEVICE} 不应有 factory"; ls out; exit 1; }
+          if ls out/ | grep -qiE 'preloader|bl31|\.fip$|gpt|initramfs|recovery'; then
+            echo "::error::产物里出现引导工件，拒绝发布"; ls out; exit 1
+          fi
+          echo "===== ${{ matrix.title }} ====="
+          ls -lh out
+          {
+            echo "## 🏗️ ${{ matrix.title }} 编译完成"
+            echo ""
+            echo "| 文件 | 大小 |"
+            echo "|---|---|"
+            ls -lh out | tail -n +2 | awk '{printf "| %s | %s |\n", $9, $5}'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传本机型产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.device }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: 📦 发布 5 机型 Release
+    needs: build
+    if: ${{ always() && needs.build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.make_release != false)) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载全部机型产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: images-*
+          path: rel
+          merge-multiple: true
+
+      - name: 生成校验文件
+        run: |
+          cd rel
+          ls -lh
+          sha256sum * > sha256sums.txt
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          DATE=$(TZ=Asia/Shanghai date +%Y%m%d)
+          TAG="${TAG_PREFIX}-${DATE}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
+          fi
+          cat > notes.md <<'EOF'
+          ImmortalWrt 25.12 · Ruijie 5 机型自动编译
+
+          - EW-6000GX PRO（MT7986A）：lan1-4 + eth1 2.5G WAN
+          - RG-X60 New（MT7986A）：lan1-3 + eth1 2.5G WAN
+          - RG-X30E Pro（MT7981B）：wan + lan1-3
+          - RG-X30E（MT7981B）：wan + lan1-3
+          - RG-BE72 Pro（MT7988D，RTL8372N DSA/U-Boot mod 256M 布局）：wan + lan1-8
+
+          共同项：
+          - 产物：每台仅 `*-squashfs-sysupgrade.bin`，不含 preloader/fip/gpt
+          - 界面：argon 主题 + iStore 市场 + 全量简体中文 + 强制 zh_cn
+          - 无线：对应 WiFi 驱动/固件；首启双频 AP，99-wifi-boost 做 CN/HE160/HE40/802.11k v r
+          - 默认 IP: 192.168.1.1 / root / 无密码
+          - 定时：每周一 08:30（北京时间）
+          - 工作流: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### 注意
+
+          1. BE72 Pro 使用 DSA mod + 256M U-Boot 布局，需先确认机器已刷对应 U-Boot；本页不含引导工件。
+          2. EW-6000GX PRO / X60 New 的 2.5G WAN 走 gmac1/eth1，LAN 走 MT7531 switch。
+          3. 首次刷机请先备份原厂分区；无线默认开放，刷入后请立即设置密码。
+          EOF
+          for i in 1 2 3 4 5; do
+            echo ">>> 第 $i 次上传"
+            if ! gh release view "$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" --title "ImmortalWrt 25.12 · Ruijie 5-in-1 ${DATE}" --notes-file notes.md || true
+            fi
+            if gh release upload "$TAG" rel/* --clobber; then
+              echo ">>> 上传成功（第 $i 次）"
+              exit 0
+            fi
+            echo ">>> 第 $i 次失败，$((i*30)) 秒后重试"
+            sleep $((i*30))
+          done
+          echo "::error::Release 上传失败，产物已保留在 Actions artifacts"
+          exit 1
